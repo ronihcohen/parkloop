@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parkloop"
+version = "0.1.0"
+readme = "README.md"
+description = "Cross-platform GPX editor and park-first running route planner"
+requires-python = ">=3.11"
+dependencies = ["PySide6-Essentials>=6.8,<7", "shapely>=2.0,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build", "pyinstaller>=6.11"]
+
+[project.gui-scripts]
+parkloop = "parkloop.app:main"
+
+[tool.setuptools.packages.find]
+include = ["parkloop*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
