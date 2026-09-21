@@ -122,3 +122,73 @@ def test_drag_reroutes_and_failure_preserves_route(monkeypatch):
     w.move_point(0,2,33,35);finish()
     assert w.route.geometry==before
     w.close()
+
+
+def _window(monkeypatch, graph):
+    from PySide6.QtWidgets import QApplication
+    from parkloop.app import Window
+    from parkloop.mapview import MapView
+    app=QApplication.instance() or QApplication([])
+    monkeypatch.setattr(Window,'restore',lambda self:None)
+    monkeypatch.setattr(Window,'persist',lambda self:None)
+    monkeypatch.setattr(MapView,'load_tile',lambda *a:None)
+    monkeypatch.setattr('parkloop.parks.fetch_graph',lambda *a,**kw:graph)
+    return app,Window()
+
+
+def _finish(app,w):
+    deadline=time.monotonic()+2
+    while w.busy and time.monotonic()<deadline:
+        app.processEvents();time.sleep(.001)
+    assert not w.busy
+
+
+def test_bulk_delete_bridges_gap_with_shortest_path(monkeypatch):
+    app,w=_window(monkeypatch,ParkGraph([way([(32,34),(32,34.002),(32.002,34.002)])],park_only=False))
+    w.commit(Route(segments=[[(32,34),(32,34.001),(32,34.0015),(32.002,34.002)]]))
+    w.delete_selected_points({(0,1),(0,2)});_finish(app,w)
+    assert w.route.geometry==[(32,34),(32,34.002),(32.002,34.002)]
+    assert len(w.route.elevations[0])==len(w.route.segments[0])
+    assert not w.map.selected
+    w.close()
+
+
+def test_bulk_delete_recloses_loop_routed(monkeypatch):
+    app,w=_window(monkeypatch,ParkGraph([way([(32,34),(32,34.002),(32.002,34.002)])],park_only=False))
+    w.commit(Route(segments=[[(32,34),(32,34.002),(32,34)]]))
+    w.delete_selected_points({(0,0)});_finish(app,w)
+    assert w.route.geometry[0]==w.route.geometry[-1]
+    assert len(w.route.geometry)>=3
+    w.close()
+
+
+def test_bulk_delete_still_deletes_when_routing_unavailable(monkeypatch):
+    from parkloop.core import RoutingError
+    app,w=_window(monkeypatch,ParkGraph([way([(32,34),(32,34.002)])],park_only=False))
+    w.router.calculate_route=lambda *a,**kw: (_ for _ in ()).throw(RoutingError('Map service unavailable'))
+    w.commit(Route(segments=[[(32,34),(32,34.001),(32,34.002)]]))
+    w.delete_selected_points({(0,1)});_finish(app,w)
+    # Points are joined directly instead of dropping the deletion.
+    assert w.route.geometry==[(32,34),(32,34.002)]
+    assert 'directly' in w.route.description
+    # A broken loop is left open (not silently dropped) when re-closing fails.
+    w.commit(Route(segments=[[(32,34),(32,34.002),(32,34)]]))
+    w.delete_selected_points({(0,0)});_finish(app,w)
+    assert w.route.geometry==[(32,34.002),(32,34)]
+    assert 'left open' in w.route.description
+    w.close()
+
+
+def test_delete_recloses_loop_straight_mode(monkeypatch):
+    app,w=_window(monkeypatch,ParkGraph([way([(32,34),(32,34.002)])],park_only=False))
+    w.snap.setCurrentIndex(1)
+    # Interior deletion keeps the loop closed without appending.
+    w.commit(Route(segments=[[(32,34),(32.001,34.001),(32,34)]]))
+    w.delete_selected_points({(0,1)})
+    assert w.route.geometry==[(32,34),(32,34)]
+    # Endpoint deletion re-closes the loop by re-appending the new start.
+    w.commit(Route(segments=[[(32,34),(32.001,34.001),(32,34)]]))
+    w.delete_point(0,0)
+    assert w.route.geometry==[(32.001,34.001),(32,34),(32.001,34.001)]
+    assert 're-closed' in w.route.description.lower()
+    w.close()

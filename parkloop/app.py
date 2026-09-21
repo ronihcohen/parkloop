@@ -7,10 +7,11 @@ from pathlib import Path
 import sys
 import threading
 from PySide6.QtCore import QObject, QSettings, Signal, QStandardPaths, Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
     QVBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QDoubleSpinBox,
-    QFileDialog, QMessageBox, QProgressBar, QFrame, QScrollArea, QListWidget, QListWidgetItem)
+    QFileDialog, QMessageBox, QProgressBar, QFrame, QScrollArea, QListWidget, QListWidgetItem,
+    QSplitter)
 from .core import Route, FootRouter, read_gpx, write_gpx, generate_any, validate_coords
 from .parks import generate_park_route, fetch_elements
 from .safety import audit_route
@@ -75,7 +76,7 @@ class Window(QMainWindow):
         self.save_place_label.clicked.connect(self.save_recent_label)
         self.place_label.returnPressed.connect(self.save_recent_label)
         self._sync_place_label()
-        self.hint = QLabel('Click to add points. Drag a point to move it.\nRight-click to delete. Shift-click a line to insert.\nDrag the map to pan; scroll to zoom.'); self.hint.setWordWrap(True); box.addWidget(self.hint)
+        self.hint = QLabel('Click to add points. Drag a point to move it.\nCtrl/Cmd-click points to select, Ctrl/Cmd-drag a rectangle for a group (Shift-drag adds).\nDelete removes the selection · Esc clears it · right-click deletes. Shift-click a line to insert.'); self.hint.setWordWrap(True); box.addWidget(self.hint)
         self.segment_label=QLabel('Routing preference'); box.addWidget(self.segment_label)
         self.snap = QComboBox(); self.snap.addItems(['Shortest walking route', 'Straight lines', 'Verified walking route']); box.addWidget(self.snap)
         self.snap.setToolTip('Choose the shortest allowed walking route, or require verified paths and sidewalks. Applies to new sections and point edits.')
@@ -100,12 +101,14 @@ class Window(QMainWindow):
             widget.hide()
         row = QHBoxLayout()
         self.close_loop = QPushButton('Close loop'); row.addWidget(self.close_loop); self.close_loop.clicked.connect(self.close_route)
+        self.select_points = QPushButton('Select points'); self.select_points.setCheckable(True); row.addWidget(self.select_points); self.select_points.toggled.connect(self.toggle_point_selection)
+        self.delete_selected = QPushButton('Delete selected'); self.delete_selected.setEnabled(False); row.addWidget(self.delete_selected); self.delete_selected.clicked.connect(lambda _checked=False: self.delete_selected_points())
         self.undo = QPushButton('Undo'); self.redo = QPushButton('Redo'); row.addWidget(self.undo); row.addWidget(self.redo); box.addLayout(row)
         self.undo.clicked.connect(self.undo_route); self.redo.clicked.connect(self.redo_route)
         self.details_toggle, details_box = self.disclosure(box,'Route details')
         self.details = QLabel('Your next run starts here.'); self.details.setWordWrap(True); details_box.addWidget(self.details)
         self.help_toggle, help_box = self.disclosure(box,'Map controls')
-        help_text=QLabel('Click to add · drag a point to move\nRight-click a point to delete\nShift-click a line to insert a point\nDrag the map to pan · scroll to zoom')
+        help_text=QLabel('Click to add · drag a point to move\nCtrl/Cmd-drag a rectangle to select a group (Shift adds)\nRight-click a point to delete · right-click a selection deletes the group\nDelete removes selection · Esc clears · Shift-click a line inserts\nDrag the map to pan · scroll to zoom')
         help_text.setWordWrap(True); help_box.addWidget(help_text)
         self.safety_note = QLabel('Road safety: not checked.'); self.safety_note.setWordWrap(True); box.addWidget(self.safety_note)
         self.check_button = QPushButton('Check road safety'); self.check_button.clicked.connect(self.check_road_safety); box.addWidget(self.check_button)
@@ -123,10 +126,16 @@ class Window(QMainWindow):
         self.cancel_button = QPushButton('Cancel'); self.cancel_button.hide(); self.cancel_button.clicked.connect(self.cancel_job); box.addWidget(self.cancel_button)
         self.export = QPushButton('Export GPX'); self.export.setObjectName('primary'); self.export.clicked.connect(self.save_gpx); box.addWidget(self.export)
         self.map = MapView(); scroll=QScrollArea(); scroll.setWidget(sidebar); scroll.setWidgetResizable(True); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); scroll.setFrameShape(QFrame.Shape.NoFrame)
-        panel=QFrame(); panel.setObjectName('sidebar'); panel.setFixedWidth(350)
+        panel=QFrame(); panel.setObjectName('sidebar'); panel.setMinimumWidth(240)
         panel_box=QVBoxLayout(panel); panel_box.setContentsMargins(0,0,0,0); panel_box.setSpacing(0); panel_box.addWidget(scroll,1); panel_box.addWidget(footer)
-        layout.addWidget(panel); layout.addWidget(self.map,1)
-        self.map.clicked.connect(self.map_click); self.map.moved.connect(self.move_point); self.map.deleted.connect(self.delete_point); self.map.inserted.connect(self.insert_point)
+        # Draggable divider so the user can resize the side panel vs the map.
+        self.splitter=QSplitter(Qt.Orientation.Horizontal); self.splitter.setChildrenCollapsible(False)
+        self.splitter.addWidget(panel); self.splitter.addWidget(self.map)
+        self.splitter.setStretchFactor(0,0); self.splitter.setStretchFactor(1,1)
+        layout.addWidget(self.splitter)
+        self._restore_splitter()
+        self.splitter.splitterMoved.connect(lambda *args: self._save_splitter())
+        self.map.clicked.connect(self.map_click); self.map.moved.connect(self.move_point); self.map.deleted.connect(self.delete_point); self.map.deleted_many.connect(self.delete_selected_points); self.map.selection_changed.connect(lambda points:self.delete_selected.setEnabled(bool(points) and not self.busy)); self.map.inserted.connect(self.insert_point)
         self.mode.currentIndexChanged.connect(self.change_mode)
         self.name.editingFinished.connect(self.rename)
         menu = self.menuBar().addMenu('File')
@@ -137,9 +146,21 @@ class Window(QMainWindow):
         edit = self.menuBar().addMenu('Edit')
         for title,shortcut,fn in [('Undo',QKeySequence.StandardKey.Undo,self.undo_route),('Redo',QKeySequence.StandardKey.Redo,self.redo_route)]:
             action=QAction(title,self); action.setShortcut(shortcut); action.triggered.connect(fn); edit.addAction(action)
+        self._delete_action=QAction('Delete selected',self); self._delete_action.setShortcuts([QKeySequence.StandardKey.Delete, QKeySequence(Qt.Key.Key_Backspace)])
+        self._delete_action.triggered.connect(lambda _checked=False: self.delete_selected_points()); edit.addAction(self._delete_action)
+        # Window-level shortcuts so Delete/Backspace/Escape work even when the
+        # map widget itself does not have keyboard focus. These MUST be kept
+        # referenced (self._delete_shortcuts) — orphaned QShortcuts are garbage
+        # collected and silently stop firing.
+        self._delete_shortcuts=[]
+        for sequence in (QKeySequence.StandardKey.Delete, QKeySequence(Qt.Key.Key_Backspace)):
+            shortcut=QShortcut(sequence,self); shortcut.setContext(Qt.ShortcutContext.WindowShortcut); shortcut.activated.connect(lambda: self.delete_selected_points())
+            self._delete_shortcuts.append(shortcut)
+        self._clear_selection_shortcut=QShortcut(QKeySequence(Qt.Key.Key_Escape),self); self._clear_selection_shortcut.setContext(Qt.ShortcutContext.WindowShortcut); self._clear_selection_shortcut.activated.connect(self.clear_point_selection)
         view = self.menuBar().addMenu('View')
         view.addAction('Fit route',lambda:self.map.fit(self.route.geometry))
         view.addAction('Hide reference',self.hide_reference)
+        view.addAction('Reset panel width',self._reset_splitter)
         maps=self.menuBar().addMenu('Map data')
         maps.addAction('Use offline map…',self.choose_offline_map)
         maps.addAction('Worldwide maps (automatic downloads)',self.use_downloaded_maps)
@@ -165,6 +186,29 @@ class Window(QMainWindow):
     def update_map_source(self):
         self.map_source.setText(f'Offline routing · {Path(mapdata.offline_path).name}' if mapdata.offline_path
                                else 'Worldwide routing · maps cached locally')
+
+    def _restore_splitter(self):
+        try:
+            state = QSettings('ParkLoop','ParkLoop').value('ui/splitter')
+            if state and self.splitter.restoreState(state):
+                return
+        except (RuntimeError, TypeError, AttributeError):
+            pass
+        self.splitter.setSizes([350, max(500, self.width() - 350)])
+
+    def _save_splitter(self):
+        try:
+            QSettings('ParkLoop','ParkLoop').setValue('ui/splitter', self.splitter.saveState())
+        except (OSError, RuntimeError):
+            pass
+
+    def _reset_splitter(self):
+        try:
+            QSettings('ParkLoop','ParkLoop').remove('ui/splitter')
+        except (OSError, RuntimeError):
+            pass
+        self.splitter.setSizes([350, max(500, self.width() - 350)])
+        self.status.setText('Panel width reset. Drag the divider to resize it.')
 
     def choose_offline_map(self):
         if self.busy:return
@@ -225,6 +269,7 @@ class Window(QMainWindow):
         self.export.setEnabled(self.route.distance_m>0 and not self.busy)
         self.check_button.setEnabled(self.route.distance_m>0 and not self.busy)
         self.close_loop.setEnabled(not self.busy and len(self.route.segments)==1 and len(self.route.geometry)>1)
+        self.delete_selected.setEnabled(bool(self.map.selected) and not self.busy)
         has_alts = bool(self.alternatives)
         self.use_alt.setEnabled(has_alts and not self.busy and self.alt_list.currentRow() >= 0)
         self.dismiss_alt.setEnabled(has_alts and not self.busy)
@@ -238,7 +283,7 @@ class Window(QMainWindow):
         self.snap.setVisible(not auto); self.close_loop.setVisible(not auto)
         self.routing_note.setVisible(not auto)
         self.hint.setObjectName('muted')
-        self.hint.setText('Use Set start on map to choose a start, then generate a loop.' if auto else 'Set a start first. Then click to extend the route or drag points to adjust it.')
+        self.hint.setText('Use Set start on map to choose a start, then generate a loop.' if auto else 'Set a start first. Click to extend, drag points to adjust.\nCtrl/Cmd-drag selects a group · Delete removes it and rejoins the gap via the shortest path.')
         self.map.update()
 
     def toggle_start_picker(self,enabled):
@@ -247,9 +292,18 @@ class Window(QMainWindow):
         self.map.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
         self.status.setText('Click the map once to set the starting point.' if enabled else 'Start selection closed.')
 
+    def toggle_point_selection(self,enabled):
+        self.map.select_mode=enabled
+        self.map.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        if not enabled:
+            self.map.selected.clear(); self.map.selection_changed.emit(set()); self.map.update()
+        self.select_points.setText('Done selecting' if enabled else 'Select points')
+        self.status.setText('Click points or drag a rectangle to select them, then Delete (Esc clears).' if enabled else 'Point selection closed.')
+
     def set_location(self):
         if self.busy:return
         self.pick_start.setChecked(False)
+        self.select_points.setChecked(False)
         try:
             point=tuple(map(float,self.location.text().split(',')))
             if len(point)!=2: raise ValueError('Enter latitude, longitude.')
@@ -312,6 +366,7 @@ class Window(QMainWindow):
 
     def save_recent_label(self):
         if self.busy:return
+        self.select_points.setChecked(False)
         point=self.recent_combo.currentData()
         if point is None:return
         key=self.format_start(point); label=self.place_label.text().strip()
@@ -482,15 +537,169 @@ class Window(QMainWindow):
             self.reroute_edit(i,j,(lat,lon)); return
         candidate=self.editable_copy(); candidate.segments[i][j]=(lat,lon); candidate.elevations[i][j]=None; candidate.description='Edited GPX geometry; moved points are not re-snapped.'; self.commit(candidate)
 
+    # A loop counts as closed when its ends meet within this tolerance, so a
+    # routed closure (whose snapped endpoint may drift by metres) is recognised.
+    CLOSED_LOOP_TOL_M = 10.0
+
+    @staticmethod
+    def _loop_closed(points):
+        from .core import haversine_m
+        return len(points) >= 2 and haversine_m(*points[0], *points[-1]) <= Window.CLOSED_LOOP_TOL_M
+
+    @staticmethod
+    def _contiguous_blocks(indices):
+        blocks = []
+        for idx in indices:
+            if blocks and idx == blocks[-1][1] + 1:
+                blocks[-1][1] = idx
+            else:
+                blocks.append([idx, idx])
+        return [(a, b) for a, b in blocks]
+
+    @staticmethod
+    def _splice_deletion(candidate, by_seg, routes):
+        """Remove deleted indices, splicing routed bridges over interior gaps.
+
+        ``routes`` maps ``(segment, first_deleted, last_deleted)`` to the
+        replacement geometry covering the gap (anchors included).
+        """
+        new_segments, new_elevations = [], []
+        for i, seg in enumerate(candidate.segments):
+            elev = candidate.elevations[i]
+            delset = by_seg.get(i)
+            if not delset:
+                new_segments.append(seg); new_elevations.append(elev); continue
+            bridged = sorted((a, b) for (ii, a, b) in routes if ii == i)
+            out_p, out_e = [], []
+            prev = 0
+            for a, b in bridged:
+                for idx in range(prev, a - 1):
+                    if idx not in delset:
+                        out_p.append(seg[idx]); out_e.append(elev[idx])
+                part = routes[(i, a, b)]
+                out_p.extend(part); out_e.extend([None] * len(part))
+                prev = b + 2
+            for idx in range(prev, len(seg)):
+                if idx not in delset:
+                    out_p.append(seg[idx]); out_e.append(elev[idx])
+            if out_p:
+                new_segments.append(out_p); new_elevations.append(out_e)
+        candidate.segments = new_segments
+        candidate.elevations = new_elevations
+
+    def _reclose_loop_straight(self, candidate):
+        """Re-append the start point for straight-line mode. Returns True if closed."""
+        if len(candidate.segments) == 1 and len(candidate.segments[0]) >= 2 \
+                and not self._loop_closed(candidate.segments[0]):
+            candidate.segments[0].append(candidate.segments[0][0])
+            candidate.elevations[0].append(None)
+            return True
+        return False
+
     def delete_point(self,i,j):
         if self.busy:return
-        if self.snap.currentIndex()!=1 and 0<j<len(self.route.segments[i])-1:
-            self.reroute_edit(i,j,None); return
-        candidate=self.editable_copy(); candidate.segments[i].pop(j); candidate.elevations[i].pop(j)
-        if not candidate.segments[i]:
-            candidate.segments.pop(i); candidate.elevations.pop(i)
-        candidate.description='Edited GPX geometry'
-        self.commit(candidate)
+        # All deletions share the bulk path: the points are always removed
+        # locally, while gap bridging / loop re-closing is best-effort routing.
+        self.delete_selected_points({(i, j)})
+
+    def delete_selected_points(self, points=None):
+        if self.busy:return
+        # Guard against Qt passing clicked(bool) when wired to a button.
+        if isinstance(points, bool):
+            points = None
+        points=set(self.map.selected if points is None else points)
+        if not points:return
+        candidate=self.editable_copy()
+        by_seg = {}
+        for item in points:
+            try:
+                i, j = item
+            except (TypeError, ValueError):
+                continue
+            if isinstance(i, bool) or isinstance(j, bool) or not isinstance(i, int) or not isinstance(j, int):
+                continue
+            if 0 <= i < len(candidate.segments) and 0 <= j < len(candidate.segments[i]):
+                by_seg.setdefault(i, set()).add(j)
+        if not by_seg:
+            self.status.setText('Selected points are no longer on the route.')
+            self.map.selected.clear(); self.map.selection_changed.emit(set()); self.refresh()
+            return
+        straight = self.snap.currentIndex() == 1
+        was_loop = (len(candidate.segments) == 1 and len(candidate.segments[0]) >= 2
+                    and self._loop_closed(candidate.segments[0]))
+        touched_end = was_loop and bool(by_seg.get(0, set()) & {0, len(candidate.segments[0]) - 1})
+        # Interior blocks leave a gap whose surviving neighbours are rejoined
+        # with the shortest walking path (routing modes only).
+        gap_plan = {}
+        if not straight:
+            for i, delset in by_seg.items():
+                n = len(candidate.segments[i])
+                for a, b in self._contiguous_blocks(sorted(delset)):
+                    if a > 0 and b < n - 1:
+                        gap_plan.setdefault(i, []).append(
+                            (a, b, candidate.segments[i][a - 1], candidate.segments[i][b + 1]))
+        if not gap_plan and not (touched_end and not straight):
+            self._splice_deletion(candidate, by_seg, {})
+            reclosed = touched_end and straight and self._reclose_loop_straight(candidate)
+            candidate.description = ('Selected route points deleted. Loop re-closed.'
+                                     if reclosed else 'Selected route points deleted. Check road safety for the updated track.')
+            self.map.selected.clear(); self.map.selection_changed.emit(set()); self.commit(candidate)
+            return
+        def work():
+            # Best effort: the deletion always succeeds locally. Each gap is
+            # bridged with the shortest walking path when available, otherwise
+            # its neighbours are joined directly so Del never no-ops offline.
+            from .core import haversine_m
+            routes = {}
+            bridged, direct = 0, 0
+            for i, blocks in gap_plan.items():
+                for a, b, left, right in blocks:
+                    if haversine_m(*left, *right) < 0.2:
+                        routes[(i, a, b)] = [left]; bridged += 1; continue
+                    try:
+                        routed = self.router.calculate_route([left, right])
+                        if not routed.geometry:
+                            raise ValueError('No walking path found.')
+                        routes[(i, a, b)] = list(routed.geometry); bridged += 1
+                    except Exception:
+                        direct += 1
+            self._splice_deletion(candidate, by_seg, routes)
+            reclosed, left_open = False, False
+            if touched_end and len(candidate.segments) == 1 and len(candidate.segments[0]) >= 2 \
+                    and not self._loop_closed(candidate.segments[0]):
+                end, start = candidate.segments[0][-1], candidate.segments[0][0]
+                if haversine_m(*end, *start) < 0.2:
+                    candidate.segments[0].append(start); candidate.elevations[0].append(None); reclosed = True
+                else:
+                    try:
+                        leg = self.router.calculate_route([end, start]).geometry
+                        if not leg:
+                            raise ValueError('No walking path found.')
+                        candidate.segments[0].extend(leg[1:]); candidate.elevations[0].extend([None] * (len(leg) - 1)); reclosed = True
+                    except Exception:
+                        left_open = True
+            if reclosed:
+                candidate.description = 'Selected route points deleted. Loop re-closed via the shortest walking path.'
+            elif left_open:
+                candidate.description = ('Selected route points deleted. Loop left open: no walking path found to re-close it. '
+                                         'Use Close loop when map data is available.')
+            elif bridged and direct:
+                candidate.description = ('Selected route points deleted. Some gaps re-joined via the shortest walking path; '
+                                         'the rest were joined directly (no path found). Check road safety for the updated track.')
+            elif bridged:
+                candidate.description = 'Selected route points deleted. Gaps re-joined via the shortest walking path. Check road safety for the updated track.'
+            else:
+                candidate.description = ('Selected route points deleted. No walking path available; points joined directly. '
+                                         'Check road safety for the updated track.')
+            return candidate
+        self.map.selected.clear(); self.map.selection_changed.emit(set())
+        self.job(work, self.commit)
+
+    def clear_point_selection(self):
+        if self.busy:return
+        if self.map.selected:
+            self.map.selected.clear(); self.map.selection_changed.emit(set()); self.map.update(); self.refresh()
+            self.status.setText('Selection cleared.')
 
     def insert_point(self,i,j,lat,lon):
         if self.busy:return
@@ -750,7 +959,7 @@ class Window(QMainWindow):
         except Exception as exc:self.failed(str(exc))
 
     def closeEvent(self,event):
-        self.cancel.set(); self.persist(); event.accept()
+        self.cancel.set(); self._save_splitter(); self.persist(); event.accept()
 
 
 STYLE = build_stylesheet(load_omarchy_colors())

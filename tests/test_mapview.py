@@ -90,3 +90,29 @@ def test_drag_preview_moves_without_changing_route(monkeypatch):
     assert view.drag_position is None
     assert view.route.geometry==points
     view.close()
+
+
+def test_multi_select_and_delete_signal(monkeypatch):
+    from PySide6.QtCore import Qt, QPoint
+    from PySide6.QtTest import QTest
+    app=_app(); monkeypatch.setattr(MapView,'load_tile',lambda *a:None)
+    view=MapView(); view.resize(600,500); view.route=Route(segments=[[(32.1,34.81),(32.101,34.811),(32.102,34.812)]])
+    view.fit(view.route.geometry);view.show();app.processEvents();deleted=[];view.deleted_many.connect(lambda p:deleted.append(p))
+    for point in view.route.geometry[:2]:
+        QTest.keyClick(view,Qt.Key.Key_Control)
+        QTest.mouseClick(view,Qt.MouseButton.LeftButton,Qt.KeyboardModifier.ControlModifier,pos=view.screen(point).toPoint())
+    assert deleted==[] and view.selected=={(0,0),(0,1)}
+    QTest.keyClick(view,Qt.Key.Key_Delete)
+    assert deleted==[{(0,0),(0,1)}] and not view.selected
+    view.close()
+
+
+def test_explicit_selection_mode_does_not_need_keyboard_modifier(monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    app=_app(); monkeypatch.setattr(MapView,'load_tile',lambda *a:None)
+    view=MapView(); view.resize(600,500); view.route=Route(segments=[[(32.1,34.81),(32.101,34.811)]])
+    view.fit(view.route.geometry);view.select_mode=True;view.show();app.processEvents()
+    QTest.mouseClick(view,Qt.MouseButton.LeftButton,pos=view.screen(view.route.geometry[0]).toPoint())
+    assert view.selected=={(0,0)}
+    view.close()

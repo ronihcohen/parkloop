@@ -56,10 +56,13 @@ class MapView(QWidget):
     moved = Signal(int, int, float, float)
     deleted = Signal(int, int)
     inserted = Signal(int, int, float, float)
+    deleted_many = Signal(object)
+    selection_changed = Signal(object)
 
     def __init__(self):
         super().__init__()
         self.setMinimumSize(500, 400)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.zoom = 14
         self.center = (32.100, 34.811)
         self.route = None
@@ -67,6 +70,8 @@ class MapView(QWidget):
         self.start = None
         self.edit = True
         self.pick_start = False
+        self.select_mode = False
+        self.selected = set()
         self.busy = False
         self.network = QNetworkAccessManager(self)
         self.tiles, self.pending, self.failed = {}, set(), {}
@@ -77,6 +82,9 @@ class MapView(QWidget):
         self.drag = None
         self.drag_position = None
         self.down = None
+        self.old_center = None
+        self.rubber_start = None
+        self.rubber_current = None
         self.fitted_points = None
         self.map_mode = os.environ.get('PARKLOOP_MAP_MODE', 'light').lower()
         if self.map_mode not in MAP_MODES:
@@ -174,7 +182,7 @@ class MapView(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         for route, color, width in ((self.reference, mc["reference"], 3), (self.route, mc["route"], 5)):
             if not route: continue
-            for segment in route.segments:
+            for i, segment in enumerate(route.segments):
                 if not segment: continue
                 screen_pts = [self.screen(pt) for pt in segment]
                 path = QPainterPath(screen_pts[0])
@@ -186,10 +194,11 @@ class MapView(QWidget):
                 if self.edit and route is self.route:
                     # Paint only distinct visible handles; hit testing still uses every point.
                     last = QPointF(-100,-100)
-                    for pt in segment:
+                    for j, pt in enumerate(segment):
                         pos = self.screen(pt)
                         if (pos-last).manhattanLength() > 15:
-                            p.setPen(QPen(QColor(color), 2)); p.setBrush(QColor(mc["handle_fill"])); p.drawEllipse(pos, 4, 4); last = pos
+                            selected = (i, j) in self.selected
+                            p.setPen(QPen(QColor(mc["route"] if selected else color), 2)); p.setBrush(QColor(mc["start"] if selected else mc["handle_fill"])); p.drawEllipse(pos, 6 if selected else 4, 6 if selected else 4); last = pos
         if self.start:
             pos = self.drag_position if self.drag == (0,0) and self.drag_position is not None else self.screen(self.start)
             p.setPen(QPen(QColor(mc["handle_fill"]), 3)); p.setBrush(QColor(mc["start"])); p.drawEllipse(pos, 9, 9)
@@ -204,6 +213,14 @@ class MapView(QWidget):
             p.setPen(QPen(QColor(mc['route']), 3))
             p.setBrush(QColor(mc['handle_fill']))
             p.drawEllipse(self.drag_position, 9, 9)
+        if self.rubber_start is not None and self.rubber_current is not None:
+            rect = QRectF(self.rubber_start, self.rubber_current).normalized()
+            if rect.width() > 4 or rect.height() > 4:
+                fill = QColor(mc['route']); fill.setAlpha(36)
+                p.fillRect(rect, fill)
+                p.setPen(QPen(QColor(mc['route']), 1.5, Qt.PenStyle.DashLine))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(rect)
         p.fillRect(QRectF(self.width()-242,self.height()-28,242,28), QColor(mc["attribution_bg"]))
         p.setPen(QColor(mc["attribution_fg"])); p.drawText(self.width()-231,self.height()-10,'© OpenStreetMap contributors · ODbL')
         if self.failed:
@@ -240,18 +257,55 @@ class MapView(QWidget):
                     if d < distance: best, distance = (i,j), d
         return best
 
+    def points_in_rect(self, rect):
+        """Route-point keys whose screen position falls inside ``rect``."""
+        found = set()
+        if not self.route or rect is None:
+            return found
+        rect = QRectF(rect).normalized()
+        for i, segment in enumerate(self.route.segments):
+            for j, point in enumerate(segment):
+                if rect.contains(self.screen(point)):
+                    found.add((i, j))
+        return found
+
     def mousePressEvent(self, e):
         self.fitted_points = None
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         self.down = e.position()
         self.drag_position = None
         self.old_center = self.world(self.center)
-        self.drag = self.nearest(e.position()) if self.edit and not self.busy and not self.pick_start else None
+        self.rubber_start = None
+        self.rubber_current = None
         if e.button() == Qt.MouseButton.RightButton:
-            if self.drag: self.deleted.emit(*self.drag)
+            hit = self.nearest(e.position()) if self.edit and not self.busy and not self.pick_start else None
+            if hit is not None:
+                if hit in self.selected and len(self.selected) > 1:
+                    self.deleted_many.emit(set(self.selected))
+                    self.selected.clear()
+                    self.selection_changed.emit(set())
+                    self.update()
+                else:
+                    self.deleted.emit(*hit)
             self.down = self.drag = None
+            return
+        selecting = self.select_mode or bool(e.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier))
+        if selecting and self.edit and not self.busy and not self.pick_start:
+            # Ctrl/Cmd-drag (or drag in Select-points mode) draws a selection
+            # rectangle instead of moving a point or panning the map.
+            self.drag = None
+            self.rubber_start = QPointF(e.position())
+            self.rubber_current = QPointF(e.position())
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        self.drag = self.nearest(e.position()) if self.edit and not self.busy and not self.pick_start and not selecting else None
 
     def mouseMoveEvent(self, e):
         if self.down is None: return
+        if self.rubber_start is not None:
+            self.rubber_current = QPointF(e.position())
+            self.update()
+            return
         if self.drag is None:
             self.center = self.coord(self.old_center-(e.position()-self.down))
         elif not self.busy:
@@ -261,6 +315,36 @@ class MapView(QWidget):
 
     def mouseReleaseEvent(self, e):
         if self.down is None: return
+        if self.rubber_start is not None:
+            rect = QRectF(self.rubber_start, e.position()).normalized()
+            if rect.width() > 4 or rect.height() > 4:
+                enclosed = self.points_in_rect(rect)
+                if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    # Shift-drag adds to the existing selection so groups can
+                    # be built up with several rectangles.
+                    self.selected |= enclosed
+                else:
+                    self.selected = enclosed
+                self.selection_changed.emit(set(self.selected))
+            elif not self.busy:
+                lat, lon = self.at(e.position())
+                if self.pick_start:
+                    self.clicked.emit(lat,lon)
+                elif self.edit:
+                    point=self.nearest(e.position())
+                    if point is not None:
+                        if point in self.selected:self.selected.remove(point)
+                        else:self.selected.add(point)
+                        self.selection_changed.emit(set(self.selected))
+            self.down = self.drag = None
+            self.drag_position = None
+            self.rubber_start = None
+            self.rubber_current = None
+            self.unsetCursor()
+            if self.select_mode:
+                self.setCursor(Qt.CursorShape.CrossCursor)
+            self.update()
+            return
         delta = (e.position()-self.down).manhattanLength()
         if not self.busy:
             lat, lon = self.at(e.position())
@@ -268,6 +352,12 @@ class MapView(QWidget):
             elif delta < 4:
                 if self.pick_start:
                     self.clicked.emit(lat,lon)
+                elif self.edit and (self.select_mode or e.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)):
+                    point=self.nearest(e.position())
+                    if point is not None:
+                        if point in self.selected:self.selected.remove(point)
+                        else:self.selected.add(point)
+                        self.selection_changed.emit(set(self.selected)); self.update()
                 elif self.edit and e.modifiers() & Qt.KeyboardModifier.ShiftModifier and self.route:
                     best, dist = None, 20
                     for i, segment in enumerate(self.route.segments):
@@ -282,6 +372,21 @@ class MapView(QWidget):
         self.drag_position = None
         self.unsetCursor()
         self.update()
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.selected and not self.busy:
+            self.deleted_many.emit(set(self.selected)); self.selected.clear(); self.selection_changed.emit(set()); self.update(); e.accept(); return
+        if e.key() == Qt.Key.Key_Escape:
+            if self.rubber_start is not None:
+                self.rubber_start = None; self.rubber_current = None
+                self.down = self.drag = None; self.drag_position = None
+                self.unsetCursor()
+                if self.select_mode:
+                    self.setCursor(Qt.CursorShape.CrossCursor)
+                self.update(); e.accept(); return
+            if self.selected:
+                self.selected.clear(); self.selection_changed.emit(set()); self.update(); e.accept(); return
+        super().keyPressEvent(e)
 
     def wheelEvent(self, e):
         self.fitted_points = None
