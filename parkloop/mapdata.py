@@ -38,13 +38,14 @@ def offline_elements():
         raise RoutingError(f'Offline map could not be loaded: {exc}. Select another map or switch to downloaded maps.') from exc
 
 
-def cached_elements(center, radius, provider):
+def cached_elements(center, radius, provider, schema=None):
     folder = cache_dir()
     if not folder.exists(): return None
     for path in sorted(folder.glob('*.json'), key=lambda p:p.stat().st_mtime, reverse=True):
         try:
             data = json.loads(path.read_text())
             if (data['provider'] == provider and
+                    (schema is None or data.get('schema') == schema) and
                     haversine_m(*center, *data['center']) + radius <= data['radius'] + 0.1):
                 return data['elements']
         except (OSError, ValueError, KeyError, TypeError):
@@ -52,7 +53,7 @@ def cached_elements(center, radius, provider):
     return None
 
 
-def save_elements(center, radius, provider, elements):
+def save_elements(center, radius, provider, elements, schema=None):
     folder = cache_dir()
     key = hashlib.sha256(json.dumps([center,radius,provider]).encode()).hexdigest()[:24]
     temporary = None
@@ -60,7 +61,7 @@ def save_elements(center, radius, provider, elements):
         folder.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(mode='w', dir=folder, suffix='.tmp', delete=False) as stream:
             temporary = Path(stream.name)
-            json.dump(dict(center=center,radius=radius,provider=provider,elements=elements),stream)
+            json.dump(dict(center=center,radius=radius,provider=provider,schema=schema,elements=elements),stream)
         temporary.replace(folder / f'{key}.json')
     except OSError:
         # A read-only/full disk must not discard a successfully downloaded map.

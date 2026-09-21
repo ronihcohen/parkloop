@@ -19,6 +19,40 @@ def test_saved_download_survives_service_failure(monkeypatch):
     assert mapdata.cached_elements((33,35),1000,'https://overpass-api.de/api/interpreter') is None
 
 
+def test_nearby_start_reuses_download_safety_margin(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(parks,'fetch_json',lambda *a,**kw:calls.append(a) or {'elements':ELEMENTS})
+    assert parks.fetch_elements((32,34),10000)==ELEMENTS
+    # A tiny start adjustment used to miss an equal-radius cache entry and
+    # redundantly repeat the large Overpass request.
+    assert parks.fetch_elements((32.001,34),10000)==ELEMENTS
+    assert len(calls)==1
+
+
+def test_download_only_requests_road_types_the_router_can_use(monkeypatch):
+    from urllib.parse import parse_qs
+    queries=[]
+    def download(url,**kwargs):
+        queries.append(parse_qs(kwargs['data'].decode())['data'][0])
+        return {'elements':ELEMENTS}
+    monkeypatch.setattr(parks,'fetch_json',download)
+    parks.fetch_elements((32,34),10000)
+    assert 'way[highway~' in queries[0]
+    assert 'motorway' not in queries[0]
+    assert 'landuse~"^(forest|' in queries[0]
+    assert 'natural~"^(wood|' in queries[0]
+
+
+def test_old_cache_without_green_area_schema_is_not_reused(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(parks,'fetch_json',lambda *a,**kw:calls.append(a) or {'elements':ELEMENTS})
+    from parkloop.mapdata import save_elements
+    provider='https://overpass-api.de/api/interpreter'
+    save_elements((32,34),6000,provider,ELEMENTS)
+    parks.fetch_elements((32,34),10000)
+    assert len(calls)==1
+
+
 def test_offline_file_routes_without_network(tmp_path,monkeypatch):
     path=tmp_path/'map.json';path.write_text(json.dumps(ELEMENTS))
     monkeypatch.setattr(mapdata,'offline_path',str(path))

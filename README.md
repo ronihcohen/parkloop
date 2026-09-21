@@ -1,7 +1,7 @@
 # ParkLoop
 
-A new, independent GPX desktop editor for Linux, Windows and macOS. Built with
-Python, Qt for Python and Shapely. No GPXRunner code or runtime dependency.
+A GPX desktop editor for Linux, Windows and macOS, built with Python, Qt for
+Python and Shapely.
 
 ## Run
 
@@ -31,6 +31,19 @@ repository, or package locally with:
 python -m pip install -e '.[dev]'
 python -m PyInstaller --noconfirm --clean --windowed --name ParkLoop launcher.py
 ```
+
+## Getting started
+
+ParkLoop opens in **Auto route** mode with the starting-point panel expanded:
+
+1. Choose a start on the map, enter latitude/longitude, or select a saved place.
+2. Set the target distance and route preference.
+3. Choose **Find route options**, preview an alternative, then select
+   **Use this route**.
+
+Labeled places stay pinned above ordinary recent coordinates and are not added
+again when reused. Switch Planning mode to **Manual editor · draw or edit** to
+create or adjust a route point by point.
 
 ## Manual editor
 
@@ -62,47 +75,58 @@ Use View → Fit route to frame the route. Drag the map to pan; scroll to zoom.
 Choose **Auto route**, click the starting point on the map (or enter latitude,
 longitude), set 1–30 km, select a preference, and generate:
 
-- **Park loop · mostly in parks** (default): use `yarkon-good` as the quality
-  benchmark: a real loop, mostly in parkland, with **no repeated paths** in either
-  direction. Mapped bridges and short paths outside park boundaries can connect the
-  loop. Park coverage is a preference, not an absolute boundary in this mode.
-- **Entirely inside parks:** explicitly requires the start and all route paths
-  to stay inside mapped park boundaries.
-- **Any walkable route:** searches pedestrian loops without a park restriction.
+- **Park-first loop · maximize green paths** (default): creates a real loop with
+  **no repeated paths** in either direction. Mapped bridges and short paths
+  outside green zones can connect the loop. Green-zone coverage is maximized,
+  not required: if no majority-green route is found, the best walkable loop
+  found is returned automatically even below 50%.
+- **Entirely inside green zones:** requires the start and every route path to
+  stay inside mapped green-zone boundaries.
+- **Any walkable route:** searches pedestrian loops without a green-zone
+  preference.
 
-Park routing uses OpenStreetMap park/garden/nature-reserve polygons and mapped
-pedestrian paths and roads with explicit sidewalk evidence. It handles multipolygon
-holes and excludes private/inaccessible ways. The default searches the complete
-pedestrian graph using bounded beam search over complete loops. Degree-two
+Park-first routing treats these mapped areas as green-zone coverage: parks,
+gardens, nature reserves, forests, woods, recreation grounds, grass, village
+greens, meadows, grassland, heath and scrub. It combines those polygons with
+mapped pedestrian paths and roads with explicit sidewalk evidence. It handles
+multipolygon holes and excludes private/inaccessible ways. A green polygon does
+not by itself make a path eligible; the path must still pass the access and
+road-safety rules. The default searches the complete pedestrian graph using
+bounded beam search over complete loops. Degree-two
 chains are compressed for search while retaining their full geometry and
 one-way restrictions. Used physical paths are blocked in both directions.
 Shortest outward/return pairs supply fast initial candidates; the search also
 explores longer alternatives that those pairs miss. A final geometric check also
-rejects overlaps hidden by different OSM IDs or different track-point sampling. Within the **5% distance tolerance**, majority
-park coverage and loop quality matter more than hitting an exact distance.
-Routes with less than 50% park coverage are rejected in the default mode.
+rejects overlaps hidden by different OSM IDs or different track-point sampling.
+Within the **5% distance tolerance**, green-zone coverage and loop quality
+matter more than hitting an exact distance. There is no minimum green-zone
+percentage in the default mode; it falls back automatically to the
+highest-coverage walkable loop the bounded search finds. Within
+those constraints, route scoring favors fewer meaningful direction changes at
+junctions so the result is easier to follow while running. Estimated navigation
+turns are shown for each alternative.
+
 **All automatic modes reject any repeated mapped path**, including small shared
 access sections or bridges, even if the resulting distance would be perfect.
-Strict park mode uses the same search and never mirrors an access leg. A start
+Entirely-inside mode uses the same search and never mirrors an access leg. A start
 on a dead-end may therefore have no valid loop; the app reports that instead of
 relaxing the rule. Returning to the starting point and crossing a path at a
 single point are allowed. There is no overlap allowance; the geometric validator
 uses only a 0.1 mm numerical tolerance. It does not fill gaps with straight lines.
 
-The result displays distance-weighted mapped park coverage and repeated-path
-percentage. `yarkon-good` remains a private local benchmark, not a hard-coded
-route or a dependency required to generate routes elsewhere.
+The result displays distance-weighted green-zone coverage, estimated navigation
+turns, verification distances, start offset and repeated-path distance.
 
 Search is bounded to 100,000 arc expansions, 192 retained states per depth,
 and 256 compressed chains per loop, at up to eight nearby starting vertices.
 The app distinguishes search-budget exhaustion from a mapped network too small
 to contain the requested distance. Exhausting this heuristic search is not a
-proof that no suitable route exists. Some
-parks have incomplete boundary/path mapping. It may reject a request even where
-a runner could find a route. It does not check opening hours, construction,
-temporary closures or accessibility beyond available OSM tags. A start may snap
-to a nearby mapped path; the park result reports the offset. If no suitable park
-loop is found, change the distance/start or select Any walkable route.
+proof that no suitable route exists. Green zones can have incomplete boundary
+or path mapping, so the search may reject a request even where a runner could
+find a route. It does not check opening hours, construction, temporary closures
+or accessibility beyond available OSM tags. A start may snap to a nearby mapped
+path; the result reports the offset. If no suitable loop is found, change the
+distance or start.
 
 ## Road and sidewalk checks
 
@@ -159,16 +183,16 @@ New areas still require a download. Background map tiles have a separate cache
 and may require internet even when route calculation works offline.
 
 Drafts and the map cache use Qt's platform-specific application data/cache
-directories. Original GPX files are never overwritten by importing. GPXRunner's
-saved database is not accessed by the application. `local-data/` is ignored by
-Git and is not included in Python packages or desktop builds.
+directories. Original GPX files are never overwritten by importing.
+`local-data/` is ignored by Git and is not included in Python packages or
+desktop builds.
 
-Internet is needed for uncached map tiles, pedestrian routing and park lookup.
+Internet is needed for uncached map tiles, pedestrian routing and green-zone lookup.
 Coordinates are sent to the selected map/routing services; no account is needed.
 The defaults are OSM tiles and Overpass. All route finding uses a locally built
 map graph with the same road/sidewalk filter; no external router can bypass it. These shared
 services can time out or throttle requests. Cancellation takes effect after an
-in-flight request finishes (park lookup can take up to two 55-second requests).
+in-flight request finishes (a routing-map lookup can take up to two 55-second requests).
 
 Override providers without changing code using `PARKLOOP_OVERPASS_URL` and `PARKLOOP_TILE_URL` (a template containing
 `{z}`, `{x}`, `{y}`). OSM attribution remains displayed. Configure suitable
@@ -185,41 +209,15 @@ python -m build
 ```
 
 Tests cover GPX round-trip geometry/elevations/segment breaks, invalid inputs,
-park-only loops, private paths, polygon holes, distance rejection, cancellation,
+green-zone-only loops, private paths, polygon holes, distance rejection, cancellation,
 and manual UI editing with undo/redo. Synthetic fixtures require no network.
 
 ### No-repeat validation
 
-Synthetic tests cover undirected edge blocking, dead-end starts in both park
+Synthetic tests cover undirected edge blocking, dead-end starts in both green-zone
 modes, duplicate OSM IDs over the same geometry, same-direction and reverse
 repetition, differently sampled overlapping segments, and rejection of repeats
 in Any walkable route. Separate parallel paths and point crossings remain valid.
-
-`yarkon-good` is the route-quality reference. Earlier generated examples with
-small repeated sections do not meet the current requirement and are not used as
-successful no-repeat examples. The generator must satisfy the no-repeat rule
-before park coverage and distance ranking can select a route.
-
-Before the sidewalk filter was added, the saved Yarkon pedestrian graph
-and `yarkon-good` start with seed 42 produced a 10.372 km loop for a 10 km request (87.3% mapped park coverage) and a
-13.949 km loop for the reference's 13.626 km request (91.3% mapped park coverage).
-Both passed the no-repeat tests, but they were **not road-safety verified**.
-The later audit rejected about 2.45 km of the 10.372 km route, mainly service
-roads and parking aisles without sidewalk evidence. Do not treat those earlier
-examples as satisfying the current routing constraints.
-
-### Sidewalk verification result
-
-The original `yarkon-good` start does not currently yield a 10 km loop satisfying
-all of the conservative sidewalk, no-repeat, and 80 m snapping constraints. The
-planner reports that instead of relaxing a requirement.
-
-A separately saved alternative starts at **32.1035782, 34.8201676**, approximately
-457 m from that start. It is **10.017 km**, **87.9% inside mapped parks**, has no
-repeated mapped path, and its entire geometry matches eligible pedestrian-path
-ways with **zero road-way segments and zero unverified distance**. Access to this
-alternative start is not part of the route and has not been verified. The local
-GPX and JSON audit are under `local-data/yarkon-sidewalk-checked-alternative-10k*`.
 
 ## Offline route-search diagnosis
 
@@ -227,28 +225,32 @@ Run `.venv/bin/python tools/diagnose_route.py ROUTE.gpx OSM.json --km 10`
 with a saved Overpass response to reproduce a request without network access.
 It reports reference length, sidewalk audit, and generation outcome.
 
-The local Yarkon snapshot on 2026-09-20 shows a separate map constraint:
-`yarkon-good.gpx` is 13.63 km, and its start has only 0.97 km of reachable
-cycle-capable paths under the sidewalk policy within the 80 m snap limit.
-The reference includes excluded and unverified sections, so it cannot certify
-a compliant 10 km route under this policy. The search fix does not bypass it
-or silently move the start to the larger network roughly 457 m away.
-
 ## Route alternatives and unverified sections
 
 Auto generation now offers up to three distinct routes in a comparison table.
-Each shows distance and target deviation, park coverage, map-checked and
-unverified kilometres/percentages, excluded distance, repeated distance, and
-start offset. Select a row and choose **Use selected route** to load and export it.
-Fewer alternatives are shown when the search finds fewer distinct loops.
+Every alternative must contain at least 30% different mapped path from every
+earlier option; reversed direction and differently sampled copies do not count
+as different routes. Each option shows distance and target deviation,
+green-zone coverage, estimated turns, map-checked and unverified distance,
+excluded distance, repeated distance and start offset. Select a row and choose
+**Use this route** to load it. Fewer alternatives are shown when the search
+cannot find three sufficiently different loops.
 
 Missing sidewalk tags on local residential, service, living-street, tertiary,
 and unclassified roads are eligible only as **unverified** alternatives.
-Missing evidence is not evidence that a route is unsafe; field verification
-(such as the user's Yarkon reference) is separate from this map assessment.
+Missing evidence is not evidence that a route is unsafe; field verification is
+separate from this map assessment.
 Explicit no-sidewalk/access restrictions, major roads without sidewalk evidence,
 and motorways remain excluded. No-repeat and distance requirements still apply.
 Map-checked options rank first. Exported descriptions retain verification distances.
-This alternative policy supersedes the strict-only auto behavior described above;
-manual walking mode now also allows these clearly labelled unverified local
-roads. The separate verified-only mode retains the strict policy.
+Manual walking mode also allows these clearly labelled unverified local roads;
+the separate verified-only mode retains the strict policy.
+
+## Auto route diagnostics
+
+Every Auto route attempt replaces `last-auto-route.log` in ParkLoop's local
+application-data directory. On Linux the default path is
+`~/.local/share/ParkLoop/ParkLoop/last-auto-route.log`. The log records the
+request, map source and cache decision, HTTP attempts, graph size, search
+progress, alternative statistics, turn counts, and the complete traceback on
+failure. A failed request also shows the log path in the status area.

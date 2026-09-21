@@ -1,24 +1,44 @@
 """Cross-platform native desktop application."""
 import copy
 from dataclasses import asdict
+from datetime import datetime, timezone
 import json
+import os
+import platform
 import re
 from pathlib import Path
 import sys
 import threading
+import traceback
 from PySide6.QtCore import QObject, QSettings, Signal, QStandardPaths, Qt
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout,
     QVBoxLayout, QLabel, QPushButton, QLineEdit, QComboBox, QDoubleSpinBox,
     QFileDialog, QMessageBox, QProgressBar, QFrame, QScrollArea, QListWidget, QListWidgetItem,
     QSplitter)
-from .core import Route, FootRouter, read_gpx, write_gpx, generate_any, validate_coords
+from .core import Route, RoutingError, FootRouter, read_gpx, write_gpx, generate_any, validate_coords
 from .parks import generate_park_route, fetch_elements
 from .safety import audit_route
 from .alternatives import generate_alternatives
 from .mapview import MapView
 from .theme import build_stylesheet, load_omarchy_colors
 from . import mapdata
+
+
+def auto_route_log_path():
+    return Path(QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)) / 'last-auto-route.log'
+
+
+def write_auto_route_log(message, *, reset=False):
+    """Write diagnostics without allowing a logging failure to break routing."""
+    try:
+        path=auto_route_log_path()
+        path.parent.mkdir(parents=True,exist_ok=True)
+        with path.open('w' if reset else 'a',encoding='utf-8') as stream:
+            stream.write(message.rstrip()+'\n')
+        return path
+    except OSError:
+        return None
 
 
 class Events(QObject):
@@ -39,6 +59,7 @@ class Window(QMainWindow):
         self.start = (32.1044, 34.8103)
         self.recent_starts = self._load_recent_starts()
         self.place_labels = self._load_place_labels()
+        self._pin_labeled_starts()
         self._label_point = None
         self._syncing_recent = False
         self.busy = False
@@ -55,17 +76,20 @@ class Window(QMainWindow):
         box = QVBoxLayout(sidebar); box.setContentsMargins(20,20,20,16); box.setSpacing(10)
         brand = QLabel('◉  ParkLoop'); brand.setObjectName('brand'); box.addWidget(brand)
         sub = QLabel('Plan your next run'); sub.setObjectName('muted'); box.addWidget(sub)
-        self.mode = QComboBox(); self.mode.addItems(['Manual editor', 'Auto route']); box.addWidget(self.mode)
+        box.addWidget(QLabel('Planning mode'))
+        self.mode = QComboBox(); self.mode.addItems(['Manual editor · draw or edit', 'Auto route · create a loop']); self.mode.setCurrentIndex(1); box.addWidget(self.mode)
         box.addWidget(QLabel('Route name'))
         self.name = QLineEdit('Untitled run'); box.addWidget(self.name)
-        self.start_toggle, start_box = self.disclosure(box,'Starting point / recent places')
-        self.pick_start=QPushButton('Set start on map'); self.pick_start.setCheckable(True); box.addWidget(self.pick_start)
+        self.start_toggle, start_box = self.disclosure(box,'1. Choose starting point')
+        self.start_toggle.setChecked(True)
+        self.pick_start=QPushButton('Choose start on map'); self.pick_start.setCheckable(True); start_box.addWidget(self.pick_start)
         self.pick_start.toggled.connect(self.toggle_start_picker)
-        start_box.addWidget(QLabel('Latitude, longitude'))
+        start_box.addWidget(QLabel('Or enter latitude, longitude'))
         self.location = QLineEdit('32.104400, 34.810300'); start_box.addWidget(self.location)
-        self.locate = QPushButton('Use coordinates'); start_box.addWidget(self.locate)
+        self.location.setPlaceholderText('Example: 32.104400, 34.810300')
+        self.locate = QPushButton('Use these coordinates'); start_box.addWidget(self.locate)
         self.locate.clicked.connect(self.set_location)
-        start_box.addWidget(QLabel('Recent places'))
+        start_box.addWidget(QLabel('Saved and recent places'))
         self.recent_combo = QComboBox(); self.recent_combo.setToolTip('Pick a recent starting point to use it again'); start_box.addWidget(self.recent_combo)
         self.recent_combo.currentIndexChanged.connect(self._recent_start_chosen)
         self._refresh_recent_combo()
@@ -85,9 +109,10 @@ class Window(QMainWindow):
         self.snap.currentIndexChanged.connect(self.update_routing_note)
         self.update_routing_note()
         self.distance = QDoubleSpinBox(); self.distance.setRange(1,30); self.distance.setValue(10); self.distance.setSuffix(' km'); self.distance.setSingleStep(.5)
-        self.target_label=QLabel('Target distance'); box.addWidget(self.target_label); box.addWidget(self.distance)
-        self.preference = QComboBox(); self.preference.addItems(['Park loop · mostly in parks', 'Entirely inside parks', 'Any walkable route']); box.addWidget(self.preference)
-        self.generate = QPushButton('Generate running route'); self.generate.setObjectName('primary'); box.addWidget(self.generate); self.generate.clicked.connect(self.auto)
+        self.target_label=QLabel('2. Target distance'); box.addWidget(self.target_label); box.addWidget(self.distance)
+        self.preference_label=QLabel('Route preference'); box.addWidget(self.preference_label)
+        self.preference = QComboBox(); self.preference.addItems(['Park-first loop · maximize green paths', 'Entirely inside green zones', 'Any walkable route']); box.addWidget(self.preference)
+        self.generate = QPushButton('3. Find route options'); self.generate.setObjectName('primary'); box.addWidget(self.generate); self.generate.clicked.connect(self.auto)
         self.alt_title = QLabel('Alternatives · select to preview'); self.alt_title.setWordWrap(True); box.addWidget(self.alt_title)
         self.alt_list = QListWidget(); self.alt_list.setMaximumHeight(180); self.alt_list.setWordWrap(True); self.alt_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff); box.addWidget(self.alt_list)
         self.alt_list.currentRowChanged.connect(self.preview_alternative)
@@ -121,7 +146,7 @@ class Window(QMainWindow):
         footer_box=QVBoxLayout(footer); footer_box.setContentsMargins(20,14,20,18); footer_box.setSpacing(8)
         self.stats = QLabel('0.00 km'); self.stats.setObjectName('distance'); footer_box.addWidget(self.stats)
         box=footer_box
-        self.status = QLabel('Ready. Choose a mode to get started.'); self.status.setWordWrap(True); box.addWidget(self.status)
+        self.status = QLabel('Ready. Choose a starting point, set the distance, then find route options.'); self.status.setWordWrap(True); box.addWidget(self.status)
         self.progress = QProgressBar(); self.progress.setRange(0,0); self.progress.hide(); box.addWidget(self.progress)
         self.cancel_button = QPushButton('Cancel'); self.cancel_button.hide(); self.cancel_button.clicked.connect(self.cancel_job); box.addWidget(self.cancel_button)
         self.export = QPushButton('Export GPX'); self.export.setObjectName('primary'); self.export.clicked.connect(self.save_gpx); box.addWidget(self.export)
@@ -279,16 +304,16 @@ class Window(QMainWindow):
         self.pick_start.setChecked(False)
         auto=self.mode.currentIndex()==1; self.map.edit=not auto
         self.generate.setVisible(auto); self.distance.setEnabled(auto); self.preference.setEnabled(auto)
-        self.segment_label.setVisible(not auto); self.target_label.setVisible(auto); self.distance.setVisible(auto); self.preference.setVisible(auto)
+        self.segment_label.setVisible(not auto); self.target_label.setVisible(auto); self.distance.setVisible(auto); self.preference_label.setVisible(auto); self.preference.setVisible(auto)
         self.snap.setVisible(not auto); self.close_loop.setVisible(not auto)
         self.routing_note.setVisible(not auto)
         self.hint.setObjectName('muted')
-        self.hint.setText('Use Set start on map to choose a start, then generate a loop.' if auto else 'Set a start first. Click to extend, drag points to adjust.\nCtrl/Cmd-drag selects a group · Delete removes it and rejoins the gap via the shortest path.')
+        self.hint.setText('Choose a start on the map or use coordinates, set the distance and preference, then find route options.' if auto else 'Set a start first. Click to extend, drag points to adjust.\nCtrl/Cmd-drag selects a group · Delete removes it and rejoins the gap via the shortest path.')
         self.map.update()
 
     def toggle_start_picker(self,enabled):
         self.map.pick_start=enabled
-        self.pick_start.setText('Cancel setting start' if enabled else 'Set start on map')
+        self.pick_start.setText('Cancel choosing start' if enabled else 'Choose start on map')
         self.map.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
         self.status.setText('Click the map once to set the starting point.' if enabled else 'Start selection closed.')
 
@@ -354,6 +379,13 @@ class Window(QMainWindow):
         except (ValueError,TypeError,AttributeError,RuntimeError,OSError):
             return {}
 
+    def _pin_labeled_starts(self):
+        """Keep saved places above ordinary history without changing group order."""
+        labeled=[]; recent=[]
+        for point in self.recent_starts:
+            (labeled if self.format_start(point) in self.place_labels else recent).append(point)
+        self.recent_starts=labeled+recent
+
     def _sync_place_label(self):
         if not hasattr(self,'place_label'):return
         point=self.recent_combo.currentData()
@@ -370,10 +402,16 @@ class Window(QMainWindow):
         point=self.recent_combo.currentData()
         if point is None:return
         key=self.format_start(point); label=self.place_label.text().strip()
+        was_labeled=key in self.place_labels
         if label:self.place_labels[key]=label
         else:self.place_labels.pop(key,None)
         QSettings('ParkLoop','ParkLoop').setValue('start/labels',json.dumps(self.place_labels))
         self.place_label.setText(label)
+        if label and not was_labeled:
+            self.recent_starts=[p for p in self.recent_starts if p!=point]
+            self.recent_starts.insert(0,point)
+        self._pin_labeled_starts()
+        self._save_recent_starts()
         self._refresh_recent_combo()
         self.status.setText('Place label saved.' if label else 'Place label removed. Coordinates will be shown.')
 
@@ -383,8 +421,14 @@ class Window(QMainWindow):
         except ValueError:
             return
         key = (round(point[0], 6), round(point[1], 6))
+        # Labeled places are pinned, so using one again must not add or move it
+        # in the ordinary recency history.
+        if key in self.recent_starts and self.format_start(key) in self.place_labels:
+            self._select_recent_match()
+            return
         self.recent_starts = [p for p in self.recent_starts if p != key]
         self.recent_starts.insert(0, key)
+        self._pin_labeled_starts()
         self.recent_starts = self.recent_starts[:self.MAX_RECENT_STARTS]
         self._save_recent_starts()
         self._refresh_recent_combo()
@@ -433,7 +477,7 @@ class Window(QMainWindow):
         self.start = point
         self.location.setText(self.format_start(point))
         self.map.center = point
-        # Re-selecting moves it to the top of the recent list.
+        # Ordinary coordinates move up by recency; labeled places stay pinned.
         self.remember_start(point)
         if self.mode.currentIndex()==0 and not self.route.geometry:
             candidate=self.editable_copy(); candidate.segments=[[point]]; self.commit(candidate); return
@@ -736,9 +780,33 @@ class Window(QMainWindow):
     def auto(self):
         if self.busy:return
         target=self.distance.value()*1000; preference=self.preference.currentIndex(); start=self.start
+        preference_name=self.preference.currentText()
+        started=datetime.now(timezone.utc).isoformat()
+        log_path=write_auto_route_log(
+            f'ParkLoop Auto route diagnostic\nStarted: {started}\n'
+            f'Python: {sys.version.split()[0]}\nPlatform: {platform.platform()}\n'
+            f'Start: {start[0]:.7f}, {start[1]:.7f}\nTarget: {target:.0f} m\n'
+            f'Preference: {preference_name}\n'
+            f'Offline map: {os.environ.get("PARKLOOP_OFFLINE_MAP") or mapdata.offline_path or "none"}',
+            reset=True)
+        def diagnostic(message):
+            timestamp=datetime.now(timezone.utc).isoformat()
+            write_auto_route_log(f'[{timestamp}] {message}')
+        def report_progress(message):
+            diagnostic(f'Progress: {message}')
+            self.events.progress.emit(message)
         def work():
-            return generate_alternatives(start,target,cancel=self.cancel,
-                progress=self.events.progress.emit,strict=preference==1,prefer_parks=preference!=2)
+            try:
+                result=generate_alternatives(start,target,cancel=self.cancel,
+                    progress=report_progress,strict=preference==1,prefer_parks=preference!=2,
+                    diagnostic=diagnostic)
+                diagnostic(f'SUCCESS: {len(result)} alternative(s) generated')
+                return result
+            except Exception as exc:
+                diagnostic(f'FAILED: {type(exc).__name__}: {exc}\n{traceback.format_exc()}')
+                if log_path:
+                    raise RoutingError(f'{exc}\nDebug log: {log_path}') from exc
+                raise
         self.job(work,self.show_alternatives)
 
     @staticmethod
@@ -748,7 +816,7 @@ class Window(QMainWindow):
         dev = distance / alternative.target_m - 1
         flag = '! unverified' if a.unknown_m > 0 else 'checked'
         return (f'Alt {index+1} · {distance/1000:.2f} km ({dev:+.1%}) · '
-                f'{r.park_fraction:.0%} park · {flag}')
+                f'{r.park_fraction:.0%} green · {r.turn_count} turns · {flag}')
 
     def show_alternatives(self, alternatives):
         if not alternatives:

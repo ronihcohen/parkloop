@@ -5,6 +5,27 @@ from shapely.ops import unary_union
 
 # Numerical tolerance only (0.1 mm), not permission to repeat a short path.
 OVERLAP_EPSILON_M = 0.0001
+# Each displayed alternative must contribute at least 30% different path.
+# Returning fewer choices is better than presenting tiny detours as new routes.
+MAX_ALTERNATIVE_SHARED_FRACTION = 0.70
+
+
+def _projected_line(points, origin):
+    lat0, lon0 = origin
+    xscale = 111320 * math.cos(math.radians(lat0))
+    return LineString([((lon - lon0) * xscale, (lat - lat0) * 111320)
+                       for lat, lon in points])
+
+
+def shared_path_fraction(points, other_points):
+    """Return the fraction of the first route shared with the second route."""
+    if len(points) < 2 or len(other_points) < 2:
+        return 0.0
+    line = _projected_line(points, points[0])
+    other = _projected_line(other_points, points[0])
+    if not line.length:
+        return 0.0
+    return min(1.0, line.intersection(other).length / line.length)
 
 
 def repeated_path_m(points):
@@ -17,10 +38,7 @@ def repeated_path_m(points):
     """
     if len(points) < 2:
         return 0.0
-    lat0, lon0 = points[0]
-    xscale = 111320 * math.cos(math.radians(lat0))
-    projected = [((lon - lon0) * xscale, (lat - lat0) * 111320)
-                 for lat, lon in points]
+    projected = list(_projected_line(points, points[0]).coords)
     lines = [LineString([a, b]) for a, b in zip(projected, projected[1:]) if a != b]
     if not lines:
         return 0.0

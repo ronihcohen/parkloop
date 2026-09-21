@@ -9,7 +9,7 @@ import heapq
 import math
 import random
 from .core import RoutingError
-from .quality import has_repeated_path
+from .quality import has_repeated_path, MAX_ALTERNATIVE_SHARED_FRACTION
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,36 @@ class LoopSearchResult:
     distance_m: float
     park_fraction: float
     stats: SearchStats
+    turn_count: int = 0
+
+
+TURN_ANGLE_DEGREES = 35
+TURN_SCORE_WEIGHT = 0.008
+
+
+def navigation_turn_count(graph, nodes, degrees=None):
+    """Count meaningful direction changes, ignoring ordinary path curvature."""
+    if len(nodes) < 3:
+        return 0
+    if degrees is None:
+        neighbors={}
+        for a,outgoing in graph.edges.items():
+            for b in outgoing:
+                neighbors.setdefault(a,set()).add(b);neighbors.setdefault(b,set()).add(a)
+        degrees={node:len(linked) for node,linked in neighbors.items()}
+    def bearing(a,b):
+        p,q=graph.points[a],graph.points[b]
+        x=(q[1]-p[1])*math.cos(math.radians((p[0]+q[0])/2))
+        y=q[0]-p[0]
+        return math.degrees(math.atan2(x,y))
+    turns=0
+    for a,b,c in zip(nodes,nodes[1:],nodes[2:]):
+        change=abs((bearing(b,c)-bearing(a,b)+180)%360-180)
+        incoming=graph.edge_evidence.get(tuple(sorted((a,b))),{}).get('way_id')
+        outgoing=graph.edge_evidence.get(tuple(sorted((b,c))),{}).get('way_id')
+        if change >= TURN_ANGLE_DEGREES and (degrees.get(b,0)!=2 or incoming!=outgoing):
+            turns+=1
+    return turns
 
 
 def compress_graph(graph, root):
@@ -135,7 +165,7 @@ def shortest_pair_candidates(graph, root, target_m, prefer_parks, rng, cancel):
                 green += length * graph.park_edges.get(tuple(sorted((a,b))), 0)
             if target_m * .95 <= distance <= target_m * 1.05:
                 fraction = green / distance
-                if (not prefer_parks or fraction >= .5) and not has_repeated_path([graph.points[n] for n in nodes]):
+                if not has_repeated_path([graph.points[n] for n in nodes]):
                     yield nodes, distance, fraction
 
 
@@ -146,12 +176,21 @@ def find_loop(graph, root, target_m, *, prefer_parks=True, cancel=None,
         raise ValueError('Search budgets must be positive.')
     adjacency = compress_graph(graph, root)
     lower = return_distances(adjacency, root)
+    neighbors={}
+    for a,outgoing in graph.edges.items():
+        for b in outgoing:
+            neighbors.setdefault(a,set()).add(b);neighbors.setdefault(b,set()).add(a)
+    degrees={node:len(linked) for node,linked in neighbors.items()}
     stats = SearchStats()
     best = None
     excluded_signatures = excluded_signatures or set()
     def already_offered(nodes):
-        return frozenset(tuple(sorted((graph.points[a],graph.points[b])))
-                         for a,b in zip(nodes,nodes[1:])) in excluded_signatures
+        edges=[(tuple(sorted((graph.points[a],graph.points[b]))),graph.edges[a][b])
+               for a,b in zip(nodes,nodes[1:])]
+        total=sum(length for _,length in edges)
+        return any(sum(length for edge,length in edges if edge in offered) / max(total,1)
+                   > MAX_ALTERNATIVE_SHARED_FRACTION
+                   for offered in excluded_signatures)
     minimum, maximum = target_m * .95, target_m * 1.05
     rng = random.Random(seed)
     if progress: progress('Finding initial loop candidates…')
@@ -159,9 +198,11 @@ def find_loop(graph, root, target_m, *, prefer_parks=True, cancel=None,
     for nodes, distance, fraction in shortest_pair_candidates(
             graph, root, target_m, prefer_parks, rng, cancel):
         if already_offered(nodes): continue
-        score = ((1-fraction)*.8 if prefer_parks else 0) + abs(distance-target_m)/target_m*.15
+        turns=navigation_turn_count(graph,nodes,degrees)
+        score = (((1-fraction)*.8 if prefer_parks else 0)
+                 + abs(distance-target_m)/target_m*.15 + turns*TURN_SCORE_WEIGHT)
         if best is None or score < best[0]:
-            best = score, nodes, distance, fraction
+            best = score, nodes, distance, fraction, turns
     # node, used undirected chain bitset, length, park distance, oriented arcs
     frontier = [(root, 0, 0.0, 0.0, ())]
     for depth in range(limits.max_depth):
@@ -192,17 +233,19 @@ def find_loop(graph, root, target_m, *, prefer_parks=True, cancel=None,
                     if minimum <= new_length <= maximum:
                         stats.within_distance += 1
                         fraction = new_green / new_length
-                        if not prefer_parks or fraction >= .5:
-                            score = ((1 - fraction) * .8 if prefer_parks else 0) + abs(new_length-target_m)/target_m * .15
-                            if best is None or score < best[0]:
-                                nodes = [root]
-                                for step in new_path: nodes.extend(step.nodes[1:])
-                                if already_offered(nodes):
-                                    continue
-                                if has_repeated_path([graph.points[n] for n in nodes]):
-                                    stats.geometry_rejected += 1
-                                else:
-                                    best = score, nodes, new_length, fraction
+                        nodes = [root]
+                        for step in new_path: nodes.extend(step.nodes[1:])
+                        turns=navigation_turn_count(graph,nodes,degrees)
+                        score = (((1 - fraction) * .8 if prefer_parks else 0)
+                                 + abs(new_length-target_m)/target_m * .15
+                                 + turns*TURN_SCORE_WEIGHT)
+                        if best is None or score < best[0]:
+                            if already_offered(nodes):
+                                continue
+                            if has_repeated_path([graph.points[n] for n in nodes]):
+                                stats.geometry_rejected += 1
+                            else:
+                                best = score, nodes, new_length, fraction, turns
                 # Passing through root is allowed, but no chain may be reused.
                 # This also supports edge-simple figure-eight loops.
                 following.append((arc.end, new_used, new_length, new_green, new_path))
@@ -238,4 +281,4 @@ def find_loop(graph, root, target_m, *, prefer_parks=True, cancel=None,
         stats.depth_reached = bool(frontier)
     if best is None:
         return LoopSearchResult(None, 0.0, 0.0, stats)
-    return LoopSearchResult(best[1], best[2], best[3], stats)
+    return LoopSearchResult(best[1], best[2], best[3], stats,best[4])

@@ -7,6 +7,23 @@ from parkloop.core import Route,read_gpx,write_gpx
 from parkloop.mapview import MapView
 
 
+def test_auto_route_is_the_clear_open_default(monkeypatch):
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(Window,'restore',lambda self:None)
+    monkeypatch.setattr(Window,'persist',lambda self:None)
+    monkeypatch.setattr(MapView,'load_tile',lambda *args:None)
+    w=Window()
+    assert w.mode.currentIndex()==1
+    assert w.mode.currentText()=='Auto route · create a loop'
+    assert w.preference.currentText()=='Park-first loop · maximize green paths'
+    assert w.start_toggle.isChecked()
+    assert w.location.isVisibleTo(w)
+    assert w.generate.text()=='3. Find route options'
+    assert w.preference_label.isVisibleTo(w)
+    assert not w.snap.isVisibleTo(w)
+    w.close()
+
+
 def test_named_exports_and_last_five_files(tmp_path,monkeypatch):
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QMessageBox
@@ -49,7 +66,7 @@ def test_manual_edit_undo_redo_and_export(tmp_path,monkeypatch):
     monkeypatch.setattr(Window,'restore',lambda self:None)
     monkeypatch.setattr(Window,'persist',lambda self:None)
     monkeypatch.setattr(MapView,'load_tile',lambda *args:None)
-    w=Window();w.snap.setCurrentIndex(1)
+    w=Window();w.mode.setCurrentIndex(0);w.snap.setCurrentIndex(1)
     initial_start=w.start
     w.map_click(32,34)
     assert w.start==initial_start and not w.route.geometry

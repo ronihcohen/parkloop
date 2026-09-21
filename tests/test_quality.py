@@ -1,7 +1,7 @@
 import threading
 import pytest
 from parkloop.core import Route,RoutingError,generate_any,polyline_length_m
-from parkloop.quality import has_repeated_path,repeated_path_m
+from parkloop.quality import has_repeated_path,repeated_path_m,shared_path_fraction
 
 
 @pytest.mark.parametrize('points',[
@@ -21,6 +21,14 @@ def test_geometry_detects_repeated_sections(points):
 ])
 def test_geometry_accepts_non_repeated_loops(points):
     assert not has_repeated_path(points)
+
+
+def test_alternative_overlap_handles_reverse_and_different_sampling():
+    route=[(0,0),(0,.01),(0,.02),(.01,.02)]
+    mostly_same=[(0,.02),(0,.015),(0,.005),(0,0),(-.01,0)]
+    distinct=[(0,0),(.01,0),(.01,.01),(.01,.02)]
+    assert shared_path_fraction(route,mostly_same)==pytest.approx(2/3,rel=.01)
+    assert shared_path_fraction(route,distinct)==pytest.approx(0,abs=1e-6)
 
 
 def road_graph(points):

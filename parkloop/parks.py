@@ -1,4 +1,4 @@
-"""Park-constrained loops on OSM pedestrian edges, with measured park coverage."""
+"""Green-zone-preferred loops on OSM pedestrian edges."""
 from __future__ import annotations
 import heapq
 import math
@@ -15,19 +15,32 @@ from .core import (haversine_m, polyline_length_m, validate_coords, fetch_json,
                    Route, RoutingError, route_from_geometry)
 
 
+GREEN_LEISURE = {'park', 'garden', 'nature_reserve'}
+GREEN_LANDUSE = {'forest', 'recreation_ground', 'grass', 'village_green', 'meadow'}
+GREEN_NATURAL = {'wood', 'grassland', 'heath', 'scrub'}
+MAP_CACHE_SCHEMA = 'green-areas-v1'
+
+
+def is_green_area(tags):
+    return (tags.get('leisure') in GREEN_LEISURE
+            or tags.get('landuse') in GREEN_LANDUSE
+            or tags.get('natural') in GREEN_NATURAL)
+
+
 @dataclass
 class ParkResult:
     route: Route
     park_fraction: float
     start_offset_m: float
     repeated_fraction: float
+    turn_count: int = 0
 
 
 def park_geometry(elements):
-    """Join multipolygon outer ways and subtract inner rings (ponds, exclusions)."""
+    """Join mapped public-style green areas and subtract multipolygon holes."""
     areas = []
     for el in elements:
-        if el.get('tags', {}).get('leisure') not in ('park', 'garden', 'nature_reserve'):
+        if not is_green_area(el.get('tags', {})):
             continue
         if el['type'] == 'way':
             pts = [(p['lon'], p['lat']) for p in el.get('geometry', [])]
@@ -118,30 +131,46 @@ class ParkGraph:
         return result[::-1]
 
 
-def fetch_elements(start, target_m):
+def fetch_elements(start, target_m, diagnostic=None):
     from .mapdata import offline_elements, cached_elements, save_elements
     local = offline_elements()
     if local is not None:
+        if diagnostic: diagnostic(f'Using offline map: {len(local)} elements')
         return local
-    # A closed route cannot reach farther than half its length.
-    radius = min(16000, target_m / 2 + 1000)
+    # A closed route cannot reach farther than half its length. Download an
+    # extra kilometre so nearby starts can safely share the same extract: the
+    # cache only needs to cover the reachable route radius, not the download's
+    # full safety margin.
+    route_radius = min(15000, target_m / 2)
+    radius = route_radius + 1000
     provider = os.environ.get('PARKLOOP_OVERPASS_URL', 'https://overpass-api.de/api/interpreter')
-    cached = cached_elements(start, radius, provider)
+    cached = cached_elements(start, route_radius, provider, schema=MAP_CACHE_SCHEMA)
     if cached is not None:
+        if diagnostic:
+            diagnostic(f'Map cache hit: required_radius={route_radius:.0f}m, elements={len(cached)}')
         return cached
+    if diagnostic:
+        diagnostic(f'Map cache miss: provider={provider}, route_radius={route_radius:.0f}m, download_radius={radius:.0f}m')
     around = f'(around:{radius:.0f},{start[0]:.6f},{start[1]:.6f})'
     query = f'''[out:json][timeout:40];(
       way[leisure~"^(park|garden|nature_reserve)$"]{around};
       relation[leisure~"^(park|garden|nature_reserve)$"]{around};
-      way[highway]{around};
+      way[landuse~"^(forest|recreation_ground|grass|village_green|meadow)$"]{around};
+      relation[landuse~"^(forest|recreation_ground|grass|village_green|meadow)$"]{around};
+      way[natural~"^(wood|grassland|heath|scrub)$"]{around};
+      relation[natural~"^(wood|grassland|heath|scrub)$"]{around};
+      way[highway~"^(footway|pedestrian|path|steps|cycleway|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|residential|unclassified|service|living_street)$"]{around};
     );out geom;'''
     data = fetch_json(provider,
         data=urllib.parse.urlencode({'data': query}).encode(),
-        headers={'User-Agent': 'ParkLoop/0.1 (desktop route planner)'}, timeout=55, retries=2)
+        headers={'User-Agent': 'ParkLoop/0.1 (desktop route planner)'}, timeout=55, retries=2,
+        diagnostic=diagnostic)
     if data.get('remark'):
+        if diagnostic: diagnostic(f'Overpass returned an incomplete result: {data["remark"]}')
         raise RoutingError(f'Map download incomplete: {data["remark"]}')
     elements = data.get('elements', [])
-    if elements: save_elements(start, radius, provider, elements)
+    if diagnostic: diagnostic(f'Map download complete: elements={len(elements)}')
+    if elements: save_elements(start, radius, provider, elements, schema=MAP_CACHE_SCHEMA)
     return elements
 
 
@@ -156,7 +185,7 @@ def generate_park_route(start, target_m, provider, *, graph=None, seed=None,
     if not math.isfinite(target_m) or not 1000 <= target_m <= 30000:
         raise ValueError('Choose a distance between 1 and 30 km.')
     cancel = cancel or threading.Event()
-    if progress: progress('Loading park boundaries and pedestrian paths…')
+    if progress: progress('Loading green-zone boundaries and pedestrian paths…')
     graph = graph if graph is not None else fetch_graph(start, target_m, park_only=strict)
     if strict and not getattr(graph, 'park_only', True):
         import copy
@@ -171,7 +200,7 @@ def generate_park_route(start, target_m, provider, *, graph=None, seed=None,
     if cancel.is_set():
         raise RoutingError('Cancelled.')
     if strict and not graph.area.covers(Point(start[1], start[0])):
-        raise RoutingError('The start is outside mapped park boundaries. Move it into the park, or choose Park loop to include access paths.')
+        raise RoutingError('The start is outside mapped green-zone boundaries. Move it into a green zone, or choose Park-first loop to include access paths.')
     return generate_preferred_loop(start, target_m, provider, graph, seed, cancel, progress, prefer_parks=prefer_parks, excluded_signatures=excluded_signatures)
 
 
@@ -191,9 +220,9 @@ def loop_metrics(graph, nodes):
 
 
 def loop_quality(distance, target, park_fraction, repeated_fraction):
-    """Repetition is invalid, regardless of distance accuracy or park coverage."""
+    """Repetition and distance are mandatory; green-zone coverage is maximized."""
     error = abs(distance - target) / target
-    return (repeated_fraction > 0, error > .05, park_fraction < .5,
+    return (repeated_fraction > 0, error > .05,
             (1 - park_fraction) * .8 + error * .15)
 
 
@@ -276,21 +305,23 @@ def generate_preferred_loop(start, target, provider, graph, seed, cancel, progre
     if best is None:
         if incomplete:
             raise RoutingError('Search limit reached without finding a loop without repeated paths '
-                               'within 5% of the requested distance and park preference. '
+                               'within 5% of the requested distance and green-zone preference. '
                                'A valid loop may still exist; try generating again or another distance.')
         raise RoutingError('No loop without repeated paths meets the requested distance '
-                           'and park preference in the map-checked network near this start.')
+                           'and green-zone preference in the map-checked network near this start.')
     _, root, result = best
     nodes, distance, park_fraction = result.nodes, result.distance_m, result.park_fraction
     repeated = 0.0
     offset = haversine_m(*start, *graph.points[root])
-    label = 'park loop' if prefer_parks else 'walking loop'
+    label = 'park-first loop' if prefer_parks else 'walking loop'
     route = route_from_geometry([graph.points[n] for n in nodes], f'{target / 1000:g} km {label}')
     allow_unknown = getattr(graph, 'include_unverified', False)
     audit = audit_route(route, graph.source_elements, include_unverified=allow_unknown)
     if audit.rejected_m or (audit.unknown_m and not allow_unknown):
         raise RoutingError('Road safety check failed. No route returned.')
-    route.description = (f'Map-checked {audit.checked_m:.0f} m; unverified {audit.unknown_m:.0f} m; loop: {park_fraction:.1%} inside mapped parks; '
-                         f'no repeated mapped paths; requested {target / 1000:g} km; '
-                         f'start snapped by {offset:.0f} m.')
-    return ParkResult(route, park_fraction, offset, repeated)
+    fallback = (' Green-zone coverage is below 50%; the best park-first candidate found was returned automatically.'
+                if prefer_parks and park_fraction < .5 else '')
+    route.description = (f'Map-checked {audit.checked_m:.0f} m; unverified {audit.unknown_m:.0f} m; loop: {park_fraction:.1%} inside mapped green zones; '
+                         f'{result.turn_count} navigation turns; no repeated mapped paths; requested {target / 1000:g} km; '
+                         f'start snapped by {offset:.0f} m.{fallback}')
+    return ParkResult(route, park_fraction, offset, repeated,result.turn_count)

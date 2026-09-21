@@ -3,7 +3,7 @@ import threading
 import pytest
 from parkloop.core import RoutingError
 from parkloop.parks import ParkGraph, generate_park_route
-from parkloop.loop_search import find_loop, SearchLimits, compress_graph
+from parkloop.loop_search import find_loop, SearchLimits, compress_graph, navigation_turn_count
 from parkloop.quality import has_repeated_path
 
 
@@ -64,3 +64,18 @@ def test_search_cancellation():
     cancel = threading.Event(); cancel.set()
     with pytest.raises(RoutingError, match='Cancelled'):
         find_loop(graph, 0, target, cancel=cancel)
+
+
+def test_navigation_turns_count_junction_choices_not_path_curvature():
+    class Graph: pass
+    graph=Graph()
+    graph.points={0:(0,0),1:(0,.01),2:(.01,.01),3:(-.01,.01)}
+    graph.edges={0:{1:1},1:{0:1,2:1,3:1},2:{1:1},3:{1:1}}
+    graph.edge_evidence={(0,1):{'way_id':10},(1,2):{'way_id':10},(1,3):{'way_id':11}}
+    assert navigation_turn_count(graph,[0,1,2])==1
+    # The same bend on a degree-two section of one mapped way is path shape,
+    # not a navigation instruction.
+    graph.edges={0:{1:1},1:{0:1,2:1},2:{1:1}}
+    assert navigation_turn_count(graph,[0,1,2])==0
+    graph.edge_evidence[(1,2)]={'way_id':12}
+    assert navigation_turn_count(graph,[0,1,2])==1

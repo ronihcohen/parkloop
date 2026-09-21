@@ -101,15 +101,23 @@ def write_gpx(route, path):
     ET.ElementTree(root).write(path, encoding='utf-8', xml_declaration=True)
 
 
-def fetch_json(url, data=None, headers=None, timeout=30, retries=1):
+def fetch_json(url, data=None, headers=None, timeout=30, retries=1, diagnostic=None):
     request = urllib.request.Request(url, data=data, headers={'User-Agent': 'ParkLoop/0.1 desktop GPX editor', **(headers or {})})
     error = None
     for attempt in range(retries):
         if attempt: time.sleep(1)
         try:
+            if diagnostic:
+                diagnostic(f'HTTP attempt {attempt + 1}/{retries}: {request.get_method()} {url} (timeout={timeout}s)')
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.load(response)
-        except Exception as exc: error = exc
+                result=json.load(response)
+                if diagnostic:
+                    diagnostic(f'HTTP response: status={getattr(response, "status", "unknown")}')
+                return result
+        except Exception as exc:
+            error = exc
+            if diagnostic:
+                diagnostic(f'HTTP attempt {attempt + 1} failed: {type(exc).__name__}: {exc}')
     raise RoutingError(f'Map service unavailable: {error}')
 
 

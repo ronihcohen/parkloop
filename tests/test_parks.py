@@ -1,6 +1,6 @@
 import threading
 import pytest
-from parkloop.parks import ParkGraph,generate_park_route,park_geometry
+from parkloop.parks import ParkGraph,generate_park_route,park_geometry,is_green_area
 from parkloop.core import RoutingError,route_from_geometry,haversine_m
 
 
@@ -12,6 +12,20 @@ def fixture():
     area=way([],[(0,0),(0,.1),(.1,.1),(.1,0),(0,0)],{'leisure':'park'})
     ring=[(.02,.02),(.02,.04),(.04,.04),(.04,.02),(.02,.02)]
     return [area,way([1,2,3,4,1],ring,{'highway':'footway'})]
+
+
+@pytest.mark.parametrize('tags',[
+    {'leisure':'park'}, {'leisure':'garden'}, {'leisure':'nature_reserve'},
+    {'landuse':'forest'}, {'landuse':'recreation_ground'}, {'landuse':'grass'},
+    {'landuse':'village_green'}, {'landuse':'meadow'}, {'natural':'wood'},
+    {'natural':'grassland'}, {'natural':'heath'}, {'natural':'scrub'},
+])
+def test_mapped_green_zones_count_as_park_coverage(tags):
+    assert is_green_area(tags)
+    area=way([],[(0,0),(0,.1),(.1,.1),(.1,0),(0,0)],tags)
+    path=way([1,2],[(.02,.02),(.02,.04)],{'highway':'footway'})
+    graph=ParkGraph([area,path],park_only=False)
+    assert graph.park_edges[(1,2)]==1
 
 
 class NoService:
@@ -26,6 +40,8 @@ def test_park_loop_is_contained_and_closed():
     assert r.route.geometry[0]==r.route.geometry[-1]==start
     assert r.park_fraction==pytest.approx(1)
     assert r.repeated_fraction==0
+    assert r.turn_count>=0
+    assert 'navigation turns' in r.route.description
 
 
 def test_private_and_nonpedestrian_edges_rejected():
@@ -70,6 +86,19 @@ def test_prefer_parks_allows_bridge_outside_boundary_to_complete_loop():
     assert .7 < result.park_fraction < .8
     assert result.repeated_fraction==0
     assert result.route.distance_m==pytest.approx(target)
+
+
+def test_park_first_falls_back_to_best_coverage_below_half():
+    # Only the southern strip of this loop is mapped as park. Park-first mode
+    # should return the best valid walking loop instead of rejecting it.
+    ring=[(.02,.02),(.02,.04),(.04,.04),(.04,.02),(.02,.02)]
+    small_area=way([],[(0,0),(0,.1),(.025,.1),(.025,0),(0,0)],{'leisure':'park'})
+    graph=ParkGraph([small_area,way([1,2,3,4,1],ring,{'highway':'footway'})],park_only=False)
+    target=sum(graph.edges[a][b] for a,b in [(1,2),(2,3),(3,4),(4,1)])
+    result=generate_park_route(graph.points[1],target,NoService(),graph=graph,seed=4)
+    assert 0 < result.park_fraction < .5
+    assert result.route.geometry[0]==result.route.geometry[-1]
+    assert 'below 50%' in result.route.description
 
 
 def test_loop_quality_prefers_good_loop_to_exact_distance_retracing():
